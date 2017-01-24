@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"net"
 	"strings"
 )
@@ -17,6 +18,7 @@ type Client struct {
 	reader   *bufio.Reader
 	writer   *bufio.Writer
 	conn     net.Conn
+	room     string
 }
 
 type Room struct {
@@ -26,12 +28,27 @@ type Room struct {
 	incoming  chan string
 }
 
+var allClients map[string]*Client
+var allRooms map[string]*Room
+
+func getClientByConn(id string) *Client {
+	client := allClients[id]
+	return client
+}
+func getRoomByName(name string) (*Room, string) {
+	var error string
+	room, present := allRooms[name]
+	if !present {
+		error = "No such room"
+	}
+	return room, error
+}
+
 func (room *Room) post(message string) {
 	for _, client := range room.clients {
 		index := strings.Index(message, "|")
-		// fmt.Println("Message: " + message) //debbuging statement
 		if message != "" && client.id != message[:index] {
-			writeMessage(client.writer, message[index+1:]+"\n")
+			writeMessage(client.writer, message[index+1:]+"\r\n")
 
 		}
 	}
@@ -51,7 +68,11 @@ func (room *Room) startRoomChat() {
 			case message := <-room.incoming:
 				room.post(message)
 			case conn := <-room.connJoins:
-				room.join(conn)
+				client, present := allClients[conn.RemoteAddr().String()]
+				if !present {
+					client = newClient(conn)
+				}
+				room.join(client)
 			}
 		}
 	}()
@@ -60,16 +81,19 @@ func writeMessage(writer *bufio.Writer, message string) {
 	writer.WriteString(message)
 	writer.Flush()
 }
-func readMessage(reader *bufio.Reader) string {
-	message, _ := reader.ReadString('\n')
+func readMessage(reader *bufio.Reader) (string, error) {
+	message, err := reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
 	message = strings.TrimSpace(message)
-	return message
+	return message, nil
 }
 func newClient(conn net.Conn) *Client {
 	writer := bufio.NewWriter(conn)
 	reader := bufio.NewReader(conn)
-	writeMessage(writer, "Enter your nickname:")
-	name := readMessage(reader)
+	writeMessage(writer, "Enter your nickname: ")
+	name, _ := readMessage(reader)
 	identifier := conn.RemoteAddr().String()
 	client := &Client{
 		name:     name,
@@ -82,30 +106,60 @@ func newClient(conn net.Conn) *Client {
 	return client
 }
 
-func (client *Client) listen() {
+func (client *Client) listen(room *Room) {
+	var action string
+	var message string
+	var error error
 	for {
-		message := readMessage(client.reader)
-		action, message := parseMessage(message)
+		message, error = readMessage(client.reader)
+		if error != nil {
+			if error.Error() == "EOF" {
+				action = "#disconnect"
+			}
+		} else {
+			action, message = parseMessage(message)
+		}
+
 		switch action {
 		case "#disconnect":
-			client.incoming <- client.id + "|" + " [" + client.name + "] disconnected from chat\n"
-			close(client.incoming)
-			client.disconnect()
+			client.disconnect(room)
 			return
+		case "#createRoom":
+			customRoom := createRoom(message)
+			customRoom.connJoins <- client.conn
+			client.leaveRoom(room)
+			delete(room.clients, client.id)
+			return
+		case "#enterRoom":
+			customRoom, error := getRoomByName(message)
+			if error == "" {
+				fmt.Println(error)
+			}
+			customRoom.connJoins <- client.conn
+			client.leaveRoom(room)
+			delete(room.clients, client.id)
 		case "message":
 			client.incoming <- client.id + "|" + " [" + client.name + "] " + message
 		case "#help":
-			writeMessage(client.writer, "#disconnect - disconnects user from chat\n	#createRoom {name} - creates room with provided name\n #enter {room name} - enters to room\n")
+			writeMessage(client.writer, " #disconnect - disconnects user from chat\r\n #createRoom {name} - creates room with provided name\r\n #enterRoom {room name} - enters to room\r\n")
 		case "empty":
 
 		default:
-			writeMessage(client.writer, "Unknown command. Type #help to list commands\n")
+			writeMessage(client.writer, "Unknown command. Type #help to list commands\r\n")
 		}
 
 	}
 }
 
-func (client *Client) disconnect() {
+func (client *Client) leaveRoom(room *Room) {
+	delete(room.clients, client.id)
+	client.incoming <- client.id + "|" + " [" + client.name + "] left the room " + room.name + "\r\n"
+}
+
+func (client *Client) disconnect(room *Room) {
+	client.incoming <- client.id + "|" + " [" + client.name + "] disconnected from chat\r\n"
+	delete(room.clients, client.id)
+	close(client.incoming)
 	client.conn.Close()
 }
 func parseMessage(message string) (string, string) {
@@ -119,6 +173,7 @@ func parseMessage(message string) (string, string) {
 		} else {
 			string := strings.Split(message, " ")
 			action = string[0]
+			message = string[1]
 		}
 
 	} else {
@@ -130,18 +185,25 @@ func parseMessage(message string) (string, string) {
 	return action, message
 }
 
-func (room *Room) join(conn net.Conn) {
-	client := newClient(conn)
-	writeMessage(client.writer, "Welcome, "+client.name+". You have entered: "+room.name+"\n")
+func (room *Room) join(client *Client) {
+	writeMessage(client.writer, "Welcome, "+client.name+". You have entered: "+room.name+"\r\n")
 
 	go func() {
 		for {
-			room.incoming <- <-client.incoming
+			message, isClosed := <-client.incoming
+			if isClosed {
+				room.incoming <- message
+			}
+			_, present := room.clients[client.id]
+			if !present {
+				return
+			}
 		}
 	}()
-	go client.listen()
-	room.introducing("User [" + client.name + "] entered the chat\n")
+	go client.listen(room)
+	room.introducing("User [" + client.name + "] entered the chat\r\n")
 	room.clients[client.id] = client
+	allClients[client.id] = client
 }
 
 func createRoom(name string) *Room {
@@ -151,21 +213,26 @@ func createRoom(name string) *Room {
 		connJoins: joinsChan,
 		clients:   map[string]*Client{},
 		incoming:  make(chan string)}
-
+	allRooms[room.name] = room
 	room.startRoomChat()
 
 	return room
 }
+func (room *Room) listenCustomRoom(connection net.Conn) {
+	for {
+		room.connJoins <- connection
+	}
+
+}
 
 func main() {
-
-	room := createRoom("lobby")
+	allClients = map[string]*Client{}
+	allRooms = map[string]*Room{}
+	room := createRoom("main")
 	listener, _ := net.Listen(CONN_TYPE, "localhost:8989")
 	defer listener.Close()
 	for {
 		connection, _ := listener.Accept()
 		room.connJoins <- connection
-		defer close(room.connJoins)
-		defer close(room.incoming)
 	}
 }
