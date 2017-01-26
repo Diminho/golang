@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
 const (
 	CONN_TYPE = "tcp"
+	LOBBY     = "main"
 )
 
 type Client struct {
@@ -26,10 +29,13 @@ type Room struct {
 	name      string
 	connJoins chan net.Conn
 	incoming  chan string
+	messages  int64
 }
 
 var allClients map[string]*Client
 var allRooms map[string]*Room
+var messages int64
+var ticker *time.Ticker
 
 func getClientByConn(id string) *Client {
 	client := allClients[id]
@@ -45,14 +51,23 @@ func getRoomByName(name string) (*Room, string) {
 }
 
 func (room *Room) post(message string) {
+
 	for _, client := range room.clients {
 		index := strings.Index(message, "|")
 		if message != "" && client.id != message[:index] {
 			writeMessage(client.writer, message[index+1:]+"\r\n")
 
+		} else if index == -1 {
+			room.printMetrics(message)
 		}
 	}
 
+}
+
+func (room *Room) printMetrics(message string) {
+	for _, client := range room.clients {
+		writeMessage(client.writer, "[Announcer] "+message+"\r\n")
+	}
 }
 
 func (room *Room) introducing(message string) {
@@ -67,12 +82,18 @@ func (room *Room) startRoomChat() {
 			select {
 			case message := <-room.incoming:
 				room.post(message)
+				atomic.AddInt64(&room.messages, 1)
 			case conn := <-room.connJoins:
 				client, present := allClients[conn.RemoteAddr().String()]
 				if !present {
 					client = newClient(conn)
 				}
 				room.join(client)
+				// case <-ticker.C:
+				// 	roomMessCount := fmt.Sprintf("%d", room.messages)
+				// 	room.incoming <- "Messages sent in room: " + roomMessCount
+				// 	// room.printMetrics("Messages sent in room: " + roomMessCount)
+				// 	fmt.Println("HELLO TICKER")
 			}
 		}
 	}()
@@ -138,10 +159,19 @@ func (client *Client) listen(room *Room) {
 			customRoom.connJoins <- client.conn
 			client.leaveRoom(room)
 			delete(room.clients, client.id)
+		case "#leave":
+			client.leaveRoom(room)
+			delete(room.clients, client.id)
+			lobbyRoom, error := getRoomByName(LOBBY)
+			if error == "" {
+				fmt.Println(error)
+			}
+			lobbyRoom.connJoins <- client.conn
+
 		case "message":
 			client.incoming <- client.id + "|" + " [" + client.name + "] " + message
 		case "#help":
-			writeMessage(client.writer, " #disconnect - disconnects user from chat\r\n #createRoom {name} - creates room with provided name\r\n #enterRoom {room name} - enters to room\r\n")
+			writeMessage(client.writer, " #disconnect - disconnects user from chat\r\n #createRoom {name} - creates room with provided name\r\n #enterRoom {room name} - enters to room\r\n #leave - user leaves current room and goes to main lobby")
 		case "empty":
 
 		default:
@@ -159,6 +189,7 @@ func (client *Client) leaveRoom(room *Room) {
 func (client *Client) disconnect(room *Room) {
 	client.incoming <- client.id + "|" + " [" + client.name + "] disconnected from chat\r\n"
 	delete(room.clients, client.id)
+	delete(allClients, client.id)
 	close(client.incoming)
 	client.conn.Close()
 }
@@ -202,6 +233,7 @@ func (room *Room) join(client *Client) {
 	}()
 	go client.listen(room)
 	room.introducing("User [" + client.name + "] entered the chat\r\n")
+	client.room = room.name
 	room.clients[client.id] = client
 	allClients[client.id] = client
 }
@@ -218,21 +250,20 @@ func createRoom(name string) *Room {
 
 	return room
 }
-func (room *Room) listenCustomRoom(connection net.Conn) {
-	for {
-		room.connJoins <- connection
-	}
-
+func init() {
+	allClients = map[string]*Client{}
+	allRooms = map[string]*Room{}
+	ticker = time.NewTicker(time.Second * 30)
 }
 
 func main() {
-	allClients = map[string]*Client{}
-	allRooms = map[string]*Room{}
-	room := createRoom("main")
+
+	room := createRoom(LOBBY)
 	listener, _ := net.Listen(CONN_TYPE, "localhost:8989")
 	defer listener.Close()
 	for {
 		connection, _ := listener.Accept()
 		room.connJoins <- connection
 	}
+
 }
