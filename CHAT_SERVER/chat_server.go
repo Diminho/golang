@@ -4,8 +4,9 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 )
 
@@ -29,13 +30,20 @@ type Room struct {
 	name      string
 	connJoins chan net.Conn
 	incoming  chan string
-	messages  int64
+}
+
+type Metrics struct {
+	messagesByRoom map[string]int64
+	allRooms       map[string]*Room
+	allClients     map[string]*Client
 }
 
 var allClients map[string]*Client
 var allRooms map[string]*Room
 var messages int64
-var ticker *time.Ticker
+
+var metrics *Metrics
+var mutex = &sync.Mutex{}
 
 func getClientByConn(id string) *Client {
 	client := allClients[id]
@@ -51,23 +59,30 @@ func getRoomByName(name string) (*Room, string) {
 }
 
 func (room *Room) post(message string) {
+	index := strings.Index(message, "|")
+	if index != -1 {
+		if !strings.HasPrefix(message, "(sys)") {
+			mutex.Lock()
+			metrics.messagesByRoom[room.name]++
+			mutex.Unlock()
+		}
 
+	}
 	for _, client := range room.clients {
-		index := strings.Index(message, "|")
-		if message != "" && client.id != message[:index] {
+		if index == -1 {
+			room.printMetrics(message, client)
+		} else if message != "" && client.id != message[:index] {
 			writeMessage(client.writer, message[index+1:]+"\r\n")
 
-		} else if index == -1 {
-			room.printMetrics(message)
 		}
 	}
 
 }
 
-func (room *Room) printMetrics(message string) {
-	for _, client := range room.clients {
-		writeMessage(client.writer, "[Announcer] "+message+"\r\n")
-	}
+func (room *Room) printMetrics(message string, client *Client) {
+
+	writeMessage(client.writer, "[Announcer] "+message+"\r\n")
+
 }
 
 func (room *Room) introducing(message string) {
@@ -82,18 +97,12 @@ func (room *Room) startRoomChat() {
 			select {
 			case message := <-room.incoming:
 				room.post(message)
-				atomic.AddInt64(&room.messages, 1)
 			case conn := <-room.connJoins:
 				client, present := allClients[conn.RemoteAddr().String()]
 				if !present {
 					client = newClient(conn)
 				}
 				room.join(client)
-				// case <-ticker.C:
-				// 	roomMessCount := fmt.Sprintf("%d", room.messages)
-				// 	room.incoming <- "Messages sent in room: " + roomMessCount
-				// 	// room.printMetrics("Messages sent in room: " + roomMessCount)
-				// 	fmt.Println("HELLO TICKER")
 			}
 		}
 	}()
@@ -131,6 +140,7 @@ func (client *Client) listen(room *Room) {
 	var action string
 	var message string
 	var error error
+
 	for {
 		message, error = readMessage(client.reader)
 		if error != nil {
@@ -159,6 +169,8 @@ func (client *Client) listen(room *Room) {
 			customRoom.connJoins <- client.conn
 			client.leaveRoom(room)
 			delete(room.clients, client.id)
+			return
+
 		case "#leave":
 			client.leaveRoom(room)
 			delete(room.clients, client.id)
@@ -167,6 +179,7 @@ func (client *Client) listen(room *Room) {
 				fmt.Println(error)
 			}
 			lobbyRoom.connJoins <- client.conn
+			return
 
 		case "message":
 			client.incoming <- client.id + "|" + " [" + client.name + "] " + message
@@ -183,11 +196,11 @@ func (client *Client) listen(room *Room) {
 
 func (client *Client) leaveRoom(room *Room) {
 	delete(room.clients, client.id)
-	client.incoming <- client.id + "|" + " [" + client.name + "] left the room " + room.name + "\r\n"
+	client.incoming <- "(sys)" + client.id + "|" + " [" + client.name + "] left the room " + room.name + "\r\n"
 }
 
 func (client *Client) disconnect(room *Room) {
-	client.incoming <- client.id + "|" + " [" + client.name + "] disconnected from chat\r\n"
+	client.incoming <- "(sys)" + client.id + "|" + " [" + client.name + "] disconnected from chat\r\n"
 	delete(room.clients, client.id)
 	delete(allClients, client.id)
 	close(client.incoming)
@@ -246,14 +259,35 @@ func createRoom(name string) *Room {
 		clients:   map[string]*Client{},
 		incoming:  make(chan string)}
 	allRooms[room.name] = room
+	metrics.messagesByRoom[room.name] = 0
 	room.startRoomChat()
+	go room.startTickAnnouncer()
 
 	return room
+}
+
+func (room *Room) startTickAnnouncer() {
+	ticker := time.NewTicker(time.Second * 30)
+	for {
+		<-ticker.C
+		message := "Messages for room [" + room.name + "]: " + strconv.FormatInt(metrics.messagesByRoom[room.name], 10) + ". Messages for all rooms: " + strconv.Itoa(metrics.countAllMessages()) + "\r\n"
+		message += "Users in room [" + room.name + "]:" + strconv.Itoa(len(room.clients)) + ". Number of rooms: " + strconv.Itoa(len(metrics.allRooms)) + ". Overall number of users: " + strconv.Itoa(len(metrics.allClients))
+		room.incoming <- message
+	}
 }
 func init() {
 	allClients = map[string]*Client{}
 	allRooms = map[string]*Room{}
-	ticker = time.NewTicker(time.Second * 30)
+	metrics = &Metrics{messagesByRoom: make(map[string]int64), allRooms: allRooms, allClients: allClients}
+}
+
+func (metrics *Metrics) countAllMessages() int {
+	var sum int64
+	for _, value := range metrics.messagesByRoom {
+		sum += value
+	}
+	return int(sum)
+
 }
 
 func main() {
